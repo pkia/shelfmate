@@ -1,5 +1,7 @@
 # ShelfMate 📚
 
+[![CI](https://github.com/pkia/shelfmate/actions/workflows/ci.yml/badge.svg)](https://github.com/pkia/shelfmate/actions/workflows/ci.yml)
+
 Paste a Goodreads profile link, get book recommendations. No account, no
 tracking, no stored profiles — anonymous for everyone.
 
