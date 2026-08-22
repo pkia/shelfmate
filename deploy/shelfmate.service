@@ -1,0 +1,12 @@
+[Unit]
+Description=ShelfMate book recommendations (:8086)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/ev/apps/shelfmate/server.py
+Restart=always
+RestartSec=5
+User=ev
+
+[Install]
+WantedBy=multi-user.target

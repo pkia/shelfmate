@@ -22,6 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("SHELFMATE_PORT", "8086"))
@@ -94,7 +95,16 @@ def fetch_url(url: str, timeout: int = PROFILE_FETCH_TIMEOUT, max_bytes: int = 3
 
 
 def looks_like_signin(html: str) -> bool:
-    return "Sign in to Goodreads" in html or "sign_in" in html and "<title>Sign in" in html
+    """True when Goodreads served the login wall instead of the profile.
+
+    Note: 'Sign in to Goodreads' appears in every page's nav — the reliable
+    signal is the <title> (wall pages are titled 'Sign in') and the fact
+    that wall pages are tiny stubs (~3 KB vs ~140 KB for a profile).
+    """
+    m = re.search(r"<title>([^<]*)</title>", html, re.I)
+    if m and m.group(1).strip().lower().startswith("sign in"):
+        return True
+    return len(html) < 12_000 and "ap/signin" in html
 
 
 def extract_name(html: str) -> str | None:
@@ -102,10 +112,12 @@ def extract_name(html: str) -> str | None:
     if not m:
         return None
     title = html_mod.unescape(m.group(1)).strip()
-    # "Jane (jane_reads) (412 books)" -> "Jane"; "Otis (otis) (1,652 books)" -> "Otis"
+    # Strip in order: trailing "(N books)", " - Location" suffix, "(handle)":
+    # "Otis Chandler (otis) - San Francisco, CA (1,652 books)" -> "Otis Chandler"
     title = re.sub(r"\s*\(\d[\d,.]*\s+books?\)\s*$", "", title)
-    title = re.sub(r"\s*\([^)]*\)\s*$", "", title)
-    return title.strip() or None
+    title = re.sub(r"\s+-\s+[^-]+$", "", title)        # " - City, State"
+    title = re.sub(r"\s*\(([^)]*)\)\s*$", "", title)    # "(handle)"
+    return re.sub(r"\s+", " ", title).strip() or None
 
 
 def _alt_books(html: str) -> list[dict]:
@@ -199,10 +211,17 @@ def _ol_get(url: str):
 
 
 def ol_find_work(title: str, author: str) -> dict | None:
-    """Best Open Library work for a title(+author). Cached, None-caching too."""
-    q = f'"{title}"'
+    """Best Open Library work for a title(+author). Cached, None-caching too.
+
+    NB: OL's search API doesn't handle quoted multi-word author values
+    (author:"Walter Isaacson" returns 0 hits / errors) — use the bare
+    first name only, then verify against the full name in results.
+    """
+    q = f'title:"{title}"'
     if author:
-        q += f' author:"{author}"'
+        first = re.sub(r"[^A-Za-z'-]", " ", author).split()[0] if author.strip() else ""
+        if first:
+            q += f" author:{first}"
     key = "work-" + hashlib.sha1(q.lower().encode()).hexdigest()[:20]
     cached = _cache_get(key, CACHE_TTL)
     if cached is not None:
@@ -286,10 +305,14 @@ def build_taste(seeds_with_subjects: list[dict]) -> Counter:
 
 def recommend(seeds: list[dict]) -> dict:
     """seeds: [{title, author?, source?}] -> {taste, recs, matched, unmatched}"""
+    # Look up all seeds on Open Library in parallel (6 workers is polite
+    # to the free API and plenty for MAX_SEEDS=30).
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        docs = list(pool.map(
+            lambda s: ol_find_work(s["title"], s.get("author", "")), seeds))
     seeds_with_subjects = []
     unmatched = []
-    for seed in seeds:
-        doc = ol_find_work(seed["title"], seed.get("author", ""))
+    for seed, doc in zip(seeds, docs):
         if doc:
             seeds_with_subjects.append({**seed, "doc": doc, "subjects": _clean_subjects(doc.get("subject"))})
         else:
@@ -302,8 +325,11 @@ def recommend(seeds: list[dict]) -> dict:
     seed_titles = {_norm_title(s["title"]) for s in seeds_with_subjects}
 
     candidates: dict[str, dict] = {}
-    for subject, weight in taste.most_common(TOP_SUBJECTS):
-        for work in ol_subject_works(subject):
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        subject_lists = list(pool.map(
+            lambda sub: ol_subject_works(sub), [s for s, _ in taste.most_common(TOP_SUBJECTS)]))
+    for subject, works in zip([s for s, _ in taste.most_common(TOP_SUBJECTS)], subject_lists):
+        for work in works:
             title = work.get("title", "")
             key = _norm_title(title)
             if not key or key in seed_titles:

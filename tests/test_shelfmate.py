@@ -70,6 +70,20 @@ def test_parse_profile_url_rejects():
 
 # ------------------------------------------------------- profile parsing
 
+def test_extract_name_variants():
+    import importlib
+    importlib.reload(server)
+    cases = [
+        ("Otis Chandler (otis) - San Francisco, CA (1,652 books)", "Otis Chandler"),
+        ("Jane Doe (412 books)", "Jane Doe"),
+        ("Dee (proudenglishmajor) (118 books)", "Dee"),
+        ("Plain Name (no-books-count)", "Plain Name"),
+    ]
+    for title, want in cases:
+        html = f"<html><title>{title}</title></html>"
+        assert server.extract_name(html) == want, (title, server.extract_name(html))
+
+
 def test_extract_favorites_and_reading():
     parsed = server.extract_books(PROFILE_HTML)
     titles = [b["title"] for b in parsed["books"]]
@@ -98,6 +112,16 @@ def test_extract_signin_wall():
     parsed = server.extract_books(SIGNIN_HTML)
     assert parsed["signin"] is True
     assert parsed["books"] == []
+
+
+def test_extract_real_profile_not_signin():
+    # "Sign in to Goodreads" sits in every page's nav — a real profile that
+    # contains that string must NOT be mistaken for the login wall.
+    html = PROFILE_HTML.replace(
+        "<body>", '<body><a href="/user/sign_in">Sign in to Goodreads</a>')
+    parsed = server.extract_books(html)
+    assert parsed["signin"] is False
+    assert parsed["books"], "nav sign-in link must not hide a real profile"
 
 
 def test_extract_empty_profile():
@@ -232,7 +256,8 @@ def test_manual_title_author_split(monkeypatch):
                         lambda t, a="": (calls.append((t, a)) or None))
     result = server.recommend_from_titles(
         ["Beloved by Toni Morrison", "Dune - Frank Herbert", "  Hamlet  "])
-    assert calls == [("Beloved", "Toni Morrison"), ("Dune", "Frank Herbert"), ("Hamlet", "")]
+    # seed lookups run in a thread pool -> arrival order varies; compare as sets
+    assert sorted(calls) == [("Beloved", "Toni Morrison"), ("Dune", "Frank Herbert"), ("Hamlet", "")]
     assert result["reason"] == "no_match"
 
 
