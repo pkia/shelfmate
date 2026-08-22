@@ -1,0 +1,10 @@
+[Unit]
+Description=ShelfMate pull-based deploy job
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+WorkingDirectory=/home/ev/apps/shelfmate
+ExecStart=/home/ev/apps/shelfmate/deploy/deploy.sh

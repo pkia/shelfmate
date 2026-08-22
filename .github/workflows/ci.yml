@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pytest ruff
+
+      - name: Lint (fatal rules only)
+        run: ruff check . --select E9,F63,F7,F82
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q .
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Sanity-check the HTML page (embedded JS parses)
+        if: matrix.python == '3.13'
+        run: |
+          python3 - <<'EOF'
+          import re, pathlib, subprocess, tempfile, os
+          html = pathlib.Path("index.html").read_text()
+          m = re.search(r"<script>(.*?)</script>", html, re.S)
+          assert m, "no inline script found"
+          with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+              f.write(m.group(1)); path = f.name
+          r = subprocess.run(["node", "--check", path], capture_output=True, text=True)
+          os.unlink(path)
+          assert r.returncode == 0, f"inline JS syntax error:\n{r.stderr}"
+          print("inline JS OK")
+          EOF

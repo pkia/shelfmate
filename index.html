@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShelfMate — book recommendations from your Goodreads</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #1b1e27; --panel2: #222633; --text: #e8e6e3;
+    --muted: #9aa0ae; --accent: #d4a254; --accent2: #7ab8a8; --err: #e07a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: Georgia, 'Times New Roman', serif; line-height: 1.6;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 20px 60px; }
+  header { text-align: center; padding: 28px 0 8px; }
+  h1 { font-size: 2.1rem; margin: 0; letter-spacing: .5px; }
+  h1 .accent { color: var(--accent); }
+  .tag { color: var(--muted); font-style: italic; margin-top: 6px; }
+  .tabs { display: flex; gap: 8px; justify-content: center; margin: 26px 0 14px; }
+  .tab {
+    padding: 8px 18px; border-radius: 20px; cursor: pointer; border: 1px solid #333846;
+    background: var(--panel); color: var(--muted); font-family: system-ui, sans-serif; font-size: .9rem;
+  }
+  .tab.active { background: var(--panel2); color: var(--text); border-color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid #2a2e3a; border-radius: 12px; padding: 22px; }
+  input[type=url], input[type=text] {
+    width: 100%; padding: 13px 15px; border-radius: 8px; border: 1px solid #333846;
+    background: var(--bg); color: var(--text); font-size: 1rem; font-family: system-ui, sans-serif;
+  }
+  input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  button.go {
+    margin-top: 12px; width: 100%; padding: 13px; border: 0; border-radius: 8px;
+    background: var(--accent); color: #1a1305; font-weight: 700; font-size: 1.05rem;
+    cursor: pointer; font-family: system-ui, sans-serif;
+  }
+  button.go:disabled { opacity: .55; cursor: wait; }
+  .hint { color: var(--muted); font-size: .85rem; margin-top: 10px; font-family: system-ui, sans-serif; }
+  .manual-row { display: flex; gap: 10px; margin-bottom: 10px; }
+  .manual-row input { flex: 1; }
+  .manual-row button.x {
+    background: none; border: 1px solid #333846; color: var(--muted); border-radius: 8px;
+    width: 44px; cursor: pointer; font-family: system-ui, sans-serif;
+  }
+  #status { text-align: center; padding: 22px 8px; color: var(--muted); font-style: italic; display: none; }
+  .error { color: var(--err); }
+  #taste { margin: 26px 0 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    background: var(--panel2); border: 1px solid #333846; color: var(--accent2);
+    padding: 4px 12px; border-radius: 14px; font-size: .82rem; font-family: system-ui, sans-serif;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 16px; margin-top: 18px; }
+  .card {
+    background: var(--panel); border: 1px solid #2a2e3a; border-radius: 10px;
+    padding: 14px; display: flex; gap: 12px; flex-direction: column;
+  }
+  .card img { width: 100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 6px; background: #2a2e3a; }
+  .card .ph { width: 100%; aspect-ratio: 2/3; border-radius: 6px; background: linear-gradient(160deg,#2a2e3a,#1b1e27); display:flex; align-items:center; justify-content:center; color:var(--muted); font-size: .8rem; text-align:center; padding: 8px; font-family: system-ui, sans-serif;}
+  .card h3 { margin: 0; font-size: 1rem; font-weight: 600; }
+  .card .auth { color: var(--muted); font-size: .85rem; font-style: italic; }
+  .card .why { color: var(--accent2); font-size: .8rem; font-family: system-ui, sans-serif; margin-top: auto; }
+  .meta { color: var(--muted); font-size: .82rem; margin: 4px 0 18px; font-family: system-ui, sans-serif; }
+  footer { margin-top: 48px; color: var(--muted); font-size: .8rem; text-align: center; font-family: system-ui, sans-serif; }
+  footer a { color: var(--accent2); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Shelf<span class="accent">Mate</span> 📚</h1>
+    <div class="tag">Paste your Goodreads profile link — get books you'll love. No account, no tracking.</div>
+  </header>
+
+  <div class="tabs">
+    <div class="tab active" id="tab-url" onclick="switchTab('url')">Goodreads link</div>
+    <div class="tab" id="tab-manual" onclick="switchTab('manual')">Type a few books</div>
+  </div>
+
+  <div class="panel" id="panel-url">
+    <input type="url" id="grurl" placeholder="https://www.goodreads.com/user/show/12345" spellcheck="false">
+    <button class="go" id="go" onclick="go()">Find my next read</button>
+    <div class="hint">Tip: open your Goodreads profile, copy the address bar link, paste it here.<br>
+    Works with private-ish profiles too — if we can't read your shelves, you can just type a few titles instead.</div>
+  </div>
+
+  <div class="panel hidden" id="panel-manual">
+    <div id="rows"></div>
+    <button class="go" onclick="addRow()" style="background:var(--panel2);color:var(--text);border:1px solid #333846">+ add another book</button>
+    <button class="go" onclick="goManual()">Find my next read</button>
+    <div class="hint">One per box — "Title" or "Title by Author". Two or three is plenty.</div>
+  </div>
+
+  <div id="status"></div>
+  <div id="taste" class="hidden"><div class="chips" id="chips"></div></div>
+  <div id="results"></div>
+
+  <footer>
+    Data from your public Goodreads profile and <a href="https://openlibrary.org" rel="noopener">Open Library</a>.
+    Nothing is stored about you — profile fetches are cached a few hours and that's it.
+    <a href="https://github.com/pkia/shelfmate">Source on GitHub</a>.
+  </footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function switchTab(which) {
+  const url = which === 'url';
+  $('tab-url').classList.toggle('active', url);
+  $('tab-manual').classList.toggle('active', !url);
+  $('panel-url').classList.toggle('hidden', !url);
+  $('panel-manual').classList.toggle('hidden', url);
+}
+
+let rowCount = 0;
+function addRow() {
+  if (rowCount >= 8) return;
+  rowCount++;
+  const row = document.createElement('div');
+  row.className = 'manual-row';
+  row.innerHTML = '<input type="text" class="mbook" placeholder="e.g. The Name of the Wind by Patrick Rothfuss" spellcheck="false">' +
+                   '<button class="x" onclick="this.parentNode.remove();rowCount--">✕</button>';
+  $('rows').appendChild(row);
+}
+addRow(); addRow(); addRow();
+
+function status(html) { const s = $('status'); s.innerHTML = html; s.style.display = 'block'; }
+function clearResults() { $('status').style.display='none'; $('taste').classList.add('hidden'); $('results').innerHTML=''; }
+
+async function go() {
+  const url = $('grurl').value.trim();
+  if (!url) { status('<span class="error">Paste your Goodreads profile link first.</span>'); return; }
+  await run({url});
+}
+async function goManual() {
+  const books = [...document.querySelectorAll('.mbook')].map(i => i.value.trim()).filter(Boolean);
+  if (!books.length) { status('<span class="error">Add at least one book you love.</span>'); return; }
+  await run({books});
+}
+
+async function run(payload) {
+  clearResults();
+  const btns = document.querySelectorAll('button.go');
+  btns.forEach(b => b.disabled = true);
+  status('Reading the shelves… this takes 10–20 seconds.');
+  try {
+    const r = await fetch('/api/recommend', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json();
+    if (data.error) { status('<span class="error">' + data.error + '</span>'); return; }
+    render(data, payload.url);
+  } catch (e) {
+    status('<span class="error">Something went wrong — try again in a moment.</span>');
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+function render(data, wasUrl) {
+  if (data.taste && data.taste.length) {
+    $('chips').innerHTML = data.taste.map(t => '<span class="chip">' + esc(t[0]) + '</span>').join('');
+    $('taste').classList.remove('hidden');
+  }
+  const who = data.profile_name ? esc(data.profile_name) + "'s taste" : 'your taste';
+  const matched = data.matched ? data.matched.length : 0;
+  let meta = 'Based on ' + matched + ' book' + (matched === 1 ? '' : 's') + ' from ' + who;
+  if (data.unmatched && data.unmatched.length) meta += ' · ' + data.unmatched.length + ' title' + (data.unmatched.length===1?'':'s') + ' couldn\u2019t be matched';
+  $('status').innerHTML = ''; $('status').style.display = 'none';
+  const grid = document.createElement('div'); grid.className = 'grid';
+  data.recs.forEach(b => {
+    const cover = b.cover_id
+      ? '<img loading="lazy" src="https://covers.openlibrary.org/b/id/' + b.cover_id + '-M.jpg" alt="">'
+      : '<div class="ph">' + esc(b.title) + '</div>';
+    grid.insertAdjacentHTML('beforeend',
+      '<div class="card">' + cover +
+      '<h3>' + esc(b.title) + '</h3>' +
+      '<div class="auth">' + esc(b.author) + '</div>' +
+      '<div class="why">' + esc(b.why) + '</div></div>');
+  });
+  const m = document.createElement('div'); m.className = 'meta'; m.textContent = meta;
+  $('results').innerHTML = ''; $('results').appendChild(m); $('results').appendChild(grid);
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+</script>
+</body>
+</html>

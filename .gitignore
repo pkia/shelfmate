@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+deploy.log
+.deployed_commit
+.deploy_failed
+cache/
+tests/__pycache__/
