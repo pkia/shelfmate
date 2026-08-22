@@ -6,3 +6,4 @@ deploy.log
 .deploy_failed
 cache/
 tests/__pycache__/
+__pycache__/

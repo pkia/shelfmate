@@ -137,6 +137,99 @@ def test_numeric_title_1984_kept():
     assert books and books[0]["title"] == "1984"
 
 
+# ------------------------------------------------------- RSS shelf feed
+
+RSS_PAGE = """<?xml version="1.0"?>
+<rss><channel><title>Jane's bookshelf: all</title>
+<item><guid><![CDATA[x1]]></guid><title>The Sea, The Sea</title>
+  <author_name>Iris Murdoch</author_name><user_rating>5</user_rating></item>
+<item><guid><![CDATA[x2]]></guid><title><![CDATA[Wuthering Heights]]></title>
+  <author_name>Emily Brontë</author_name><user_rating>0</user_rating></item>
+<item><guid><![CDATA[x3]]></guid><title>The Sea, The Sea</title>
+  <author_name>Iris Murdoch</author_name><user_rating>5</user_rating></item>
+<item><guid><![CDATA[x4]]></guid><title>Writers &amp; Lovers</title>
+  <author_name>Lily King</author_name><user_rating>3</user_rating></item>
+</channel></rss>"""
+
+
+def test_parse_rss_titles_authors_ratings():
+    books = server.parse_rss(RSS_PAGE)
+    assert len(books) == 3                      # dedupe: "The Sea, The Sea" twice
+    assert books[0] == {"title": "The Sea, The Sea", "author": "Iris Murdoch",
+                        "rating": "5", "source": "shelf"}
+    assert books[1]["title"] == "Wuthering Heights"      # CDATA stripped
+    assert books[2]["title"] == "Writers & Lovers"       # entity unescaped
+    assert books[2]["rating"] == "3"
+
+
+def test_fetch_shelf_rss_pagination(monkeypatch):
+    pages = {1: server.parse_rss(RSS_PAGE),                          # 3 < 100 → stop
+             2: [ {"title": "Never", "author": "x", "rating": "4", "source": "shelf"} ]}
+    calls = []
+    def fake_fetch(url, timeout=15, max_bytes=0):
+        calls.append(url)
+        page = 1 if "page=1" in url or "page=" not in url else 2
+        return ("<rss><channel>" + "".join(
+            f"<item><title>{b['title']}</title><author_name>{b['author']}</author_name>"
+            f"<user_rating>{b['rating']}</user_rating></item>" for b in pages[page])
+            + "</channel></rss>").encode()
+    monkeypatch.setattr(server, "fetch_url", fake_fetch)
+    books = server.fetch_shelf_rss("12345")
+    assert len(books) == 3 and books[0]["title"] == "The Sea, The Sea"
+    assert len(calls) == 1, "short first page must stop pagination"
+
+
+def test_pick_seeds_favorites_and_ratings_first():
+    shelf = [
+        {"title": "Unrated Recent", "author": "", "rating": "0", "source": "shelf"},
+        {"title": "Meh 1-star", "author": "", "rating": "1", "source": "shelf"},
+        {"title": "Loved 5-star", "author": "", "rating": "5", "source": "shelf"},
+    ]
+    favorites = [{"title": "Fav Pick", "author": "A", "source": "favorite"}]
+    seeds = server._pick_seeds(shelf, favorites, cap=10)
+    assert [s["title"] for s in seeds] == ["Fav Pick", "Loved 5-star", "Meh 1-star", "Unrated Recent"]
+    capped = server._pick_seeds(shelf, favorites, cap=2)
+    assert [s["title"] for s in capped] == ["Fav Pick", "Loved 5-star"]
+
+
+def test_seed_weight_scales_with_rating():
+    assert server.seed_weight({"source": "favorite"}) == 1.5
+    assert server.seed_weight({"source": "shelf", "rating": "5"}) == 2.0
+    assert server.seed_weight({"source": "shelf", "rating": "1"}) == 0.8
+    assert server.seed_weight({"source": "shelf", "rating": "0"}) == 1.0
+    assert server.seed_weight({"source": "shelf", "rating": ""}) == 1.0
+    assert server.seed_weight({"source": "manual"}) == 1.0
+
+
+def test_extract_library_size():
+    html = "<title>Jane Doe (156 books)</title>"
+    assert server.extract_library_size(html) == 156
+    html = "<title>Otis (1,652 books) — San Francisco</title>"
+    assert server.extract_library_size(html) == 1652
+    assert server.extract_library_size("<title>No count here</title>") is None
+
+
+def test_recommend_excludes_whole_shelf(monkeypatch):
+    # A book on the user's shelf (but not a seed) must not be recommended.
+    doc = {"key": "/works/OL1W", "title": "Seed Book", "author_name": ["A"],
+           "subject": ["love", "grief"], "edition_count": 9, "cover_id": 1}
+    shelf_book = {"key": "/works/OL2W", "title": "Already On Shelf", "author_name": ["A"],
+                  "subject": ["love", "grief"], "edition_count": 9, "cover_id": 2}
+    _fake_ol(monkeypatch,
+             {"Seed Book": doc, "Already On Shelf": shelf_book},
+             {"love": [{"title": "Already On Shelf", "authors": [{"name": "A"}],
+                        "edition_count": 9, "cover_id": 2, "key": "/works/OL2W"},
+                       {"title": "New Suggestion", "authors": [{"name": "B"}],
+                        "edition_count": 9, "cover_id": 3, "key": "/works/OL3W",
+                        "subject": ["love"]}],
+              "grief": []})
+    result = server.recommend([{"title": "Seed Book", "source": "manual"}],
+                              exclude_titles=["Already On Shelf"])
+    titles = [r["title"] for r in result["recs"]]
+    assert "Already On Shelf" not in titles
+    assert "New Suggestion" in titles
+
+
 # ---------------------------------------------------------- normalisation
 
 def test_norm_title_strips_series():
