@@ -142,13 +142,20 @@ async function goManual() {
   await run({books});
 }
 
+// Resolve the API relative to where this page is mounted. The app can be
+// served at "/" (local dev) or under a proxy prefix like "/shelfmate"
+// (tailscale funnel), and an absolute "/api/..." would escape the prefix.
+const API_BASE = location.pathname
+  .replace(/(?:^|\/)index\.html$/, '')
+  .replace(/\/+$/, '');
+
 async function run(payload) {
   clearResults();
   const btns = document.querySelectorAll('button.go');
   btns.forEach(b => b.disabled = true);
   status('Reading the shelves… this takes 10–20 seconds.');
   try {
-    const r = await fetch('/api/recommend', {
+    const r = await fetch(API_BASE + '/api/recommend', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
