@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""ShelfMate: paste a Goodreads profile link, get book recommendations.
+
+Anonymous, no accounts, no tracking. Runs on a Raspberry Pi behind a
+Tailscale funnel. Data sources:
+  - Goodreads public profile pages (favorites + currently reading)
+  - Open Library (subjects, similar works, covers)
+
+Stdlib only. See README.md for the architecture notes.
+"""
+from __future__ import annotations
+
+import hashlib
+import html as html_mod
+import json
+import math
+import os
+import re
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from collections import Counter
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("SHELFMATE_PORT", "8086"))
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(ROOT, "cache")
+CACHE_TTL = 7 * 24 * 3600          # Open Library data is stable
+PROFILE_TTL = 6 * 3600             # Goodreads profiles change slowly
+PROFILE_FETCH_TIMEOUT = 15
+OL_FETCH_TIMEOUT = 12
+UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0")
+
+# Per-IP request budget for the public API.
+RATE_WINDOW = 60
+RATE_MAX = 6
+_rate_lock = threading.Lock()
+_rate: dict[str, list[float]] = {}
+
+# Subjects that carry no taste signal (cataloguing artifacts, mega-genres).
+SUBJECT_STOPLIST = {
+    "protected daisy", "in library", "accessible book", "overdrive",
+    "large type books", "internet archive wishlist", "bookgorilla",
+    "open library staff picks", "reading level-2", "fiction",
+    "nonfiction", "general", "juvenile fiction", "juvenile literature",
+    "popular print disabled books", "internet archive",
+}
+MAX_SEEDS = 30
+MAX_SUBJECTS_PER_BOOK = 14
+TOP_SUBJECTS = 6
+MAX_RECS = 12
+MIN_OVERLAP = 0.99       # absolute floor: at least one shared subject of unit weight
+REL_OVERLAP = 0.35       # ...and keep only candidates within this fraction of the best match
+
+
+# --------------------------------------------------------------------------
+# Goodreads profile: URL parsing, fetching, extraction
+# --------------------------------------------------------------------------
+
+def parse_profile_url(url: str) -> str | None:
+    """Accept any goodreads profile URL shape, return canonical /user/show/N URL.
+
+    Handles:
+      https://www.goodreads.com/user/show/12345
+      https://www.goodreads.com/user/show/12345-jane-doe
+      https://www.goodreads.com/user/show/12345?shelf=read
+      goodreads.com/user/show/12345 (no scheme)
+    Returns None for anything that isn't a profile URL.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if not host.endswith("goodreads.com"):
+        return None
+    m = re.match(r"^/user/show/(\d+)", parts.path)
+    if not m:
+        return None
+    return f"https://www.goodreads.com/user/show/{m.group(1)}"
+
+
+def fetch_url(url: str, timeout: int = PROFILE_FETCH_TIMEOUT, max_bytes: int = 3_000_000) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(max_bytes)
+
+
+def looks_like_signin(html: str) -> bool:
+    return "Sign in to Goodreads" in html or "sign_in" in html and "<title>Sign in" in html
+
+
+def extract_name(html: str) -> str | None:
+    m = re.search(r"<title>([^<]+)</title>", html)
+    if not m:
+        return None
+    title = html_mod.unescape(m.group(1)).strip()
+    # "Jane (jane_reads) (412 books)" -> "Jane"; "Otis (otis) (1,652 books)" -> "Otis"
+    title = re.sub(r"\s*\(\d[\d,.]*\s+books?\)\s*$", "", title)
+    title = re.sub(r"\s*\([^)]*\)\s*$", "", title)
+    return title.strip() or None
+
+
+def _alt_books(html: str) -> list[dict]:
+    """Favorite books: <img alt="Title by Author" ...> inside cover grids."""
+    books = []
+    seen = set()
+    for m in re.finditer(
+        r'<img[^>]+alt="([^"]*?) by ([^"]*?)"[^>]*>', html
+    ):
+        title = html_mod.unescape(m.group(1)).strip()
+        author = re.sub(r"\s+", " ", html_mod.unescape(m.group(2)).strip())
+        if not title or len(title) > 200 or title.lower() in seen:
+            continue
+        if re.fullmatch(r"[\d.,#/ -]+", title):  # "1984" ok, "3.9" not
+            if title != "1984":
+                continue
+        seen.add(title.lower())
+        books.append({"title": title, "author": author, "source": "favorite"})
+    return books
+
+
+def _reading_books(html: str) -> list[dict]:
+    """Currently-reading: <a class="bookTitle" href="/book/show/N-slug">Title</a>."""
+    books = []
+    seen = set()
+    for m in re.finditer(
+        r'<a[^>]+class="bookTitle"[^>]+href="/book/show/\d+[^"]*"[^>]*>([^<]+)</a>', html
+    ):
+        title = html_mod.unescape(m.group(1)).strip()
+        key = title.lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        books.append({"title": title, "author": "", "source": "reading"})
+    return books
+
+
+def extract_books(html: str) -> dict:
+    """Parse a Goodreads profile page into name + seed books."""
+    if looks_like_signin(html):
+        return {"name": None, "books": [], "signin": True}
+    favorites = _alt_books(html)
+    reading = _reading_books(html)
+    fav_titles = {b["title"].lower() for b in favorites}
+    books = favorites + [b for b in reading if b["title"].lower() not in fav_titles]
+    return {
+        "name": extract_name(html),
+        "books": books[:MAX_SEEDS],
+        "signin": False,
+    }
+
+
+# --------------------------------------------------------------------------
+# Open Library client (with on-disk cache)
+# --------------------------------------------------------------------------
+
+def _cache_get(key: str, ttl: int):
+    path = os.path.join(CACHE_DIR, key + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            entry = json.load(f)
+        if time.time() - entry["t"] < ttl:
+            return entry["v"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _cache_put(key: str, value) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, key + ".json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"t": time.time(), "v": value}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _ol_get(url: str):
+    key = "ol-" + hashlib.sha1(url.encode()).hexdigest()[:20]
+    cached = _cache_get(key, CACHE_TTL)
+    if cached is not None:
+        return cached
+    req = urllib.request.Request(url, headers={"User-Agent": "ShelfMate/1.0 (book recommendations)"})
+    with urllib.request.urlopen(req, timeout=OL_FETCH_TIMEOUT) as resp:
+        data = json.loads(resp.read(2_000_000))
+    _cache_put(key, data)
+    return data
+
+
+def ol_find_work(title: str, author: str) -> dict | None:
+    """Best Open Library work for a title(+author). Cached, None-caching too."""
+    q = f'"{title}"'
+    if author:
+        q += f' author:"{author}"'
+    key = "work-" + hashlib.sha1(q.lower().encode()).hexdigest()[:20]
+    cached = _cache_get(key, CACHE_TTL)
+    if cached is not None:
+        return cached or None
+    url = (
+        "https://openlibrary.org/search.json?per_page=5&fields=key,title,author_name,subject,"
+        "edition_count,first_publish_year,cover_i&sort=editions&q="
+        + urllib.parse.quote(q)
+    )
+    try:
+        data = _ol_get(url)
+        docs = data.get("docs") or []
+        best = _pick_best_doc(docs, title, author)
+        _cache_put(key, best or {})
+        return best
+    except Exception:
+        return None  # network hiccup: don't negative-cache, retry next time
+
+
+def _norm_title(t: str) -> str:
+    t = t.lower()
+    t = re.sub(r"\([^)]*\)", "", t)       # series "(City Spies #7)"
+    t = re.sub(r"[^a-z0-9 ]", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _pick_best_doc(docs: list[dict], title: str, author: str) -> dict | None:
+    want = _norm_title(title)
+    author_l = (author or "").lower()
+    for doc in docs:  # docs arrive sorted by editions; prefer exact title match
+        if _norm_title(doc.get("title", "")) == want:
+            if author_l and doc.get("author_name") and author_l.split()[0] not in {
+                a.lower() for a in doc["author_name"]
+            }:
+                continue
+            return doc
+    for doc in docs:
+        if want and want in _norm_title(doc.get("title", "")):
+            return doc
+    return None
+
+
+def ol_subject_works(subject: str, limit: int = 30) -> list[dict]:
+    url = (
+        "https://openlibrary.org/subjects/"
+        + urllib.parse.quote(subject.lower())
+        + f".json?details=false&limit={limit}"
+    )
+    try:
+        data = _ol_get(url)
+        return data.get("works") or []
+    except Exception:
+        return []
+
+
+# --------------------------------------------------------------------------
+# Recommender
+# --------------------------------------------------------------------------
+
+def _clean_subjects(raw: list[str]) -> list[str]:
+    out, seen = [], set()
+    for s in raw or []:
+        s = re.sub(r"\s+", " ", (s or "").strip().lower())
+        if not s or len(s) < 3 or s in SUBJECT_STOPLIST or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= MAX_SUBJECTS_PER_BOOK:
+            break
+    return out
+
+
+def build_taste(seeds_with_subjects: list[dict]) -> Counter:
+    taste = Counter()
+    for seed in seeds_with_subjects:
+        weight = 1.5 if seed.get("source") == "favorite" else 1.0
+        for s in seed["subjects"]:
+            taste[s] += weight
+    return taste
+
+
+def recommend(seeds: list[dict]) -> dict:
+    """seeds: [{title, author?, source?}] -> {taste, recs, matched, unmatched}"""
+    seeds_with_subjects = []
+    unmatched = []
+    for seed in seeds:
+        doc = ol_find_work(seed["title"], seed.get("author", ""))
+        if doc:
+            seeds_with_subjects.append({**seed, "doc": doc, "subjects": _clean_subjects(doc.get("subject"))})
+        else:
+            unmatched.append(seed["title"])
+
+    if not seeds_with_subjects:
+        return {"taste": {}, "recs": [], "matched": [], "unmatched": unmatched, "reason": "no_match"}
+
+    taste = build_taste(seeds_with_subjects)
+    seed_titles = {_norm_title(s["title"]) for s in seeds_with_subjects}
+
+    candidates: dict[str, dict] = {}
+    for subject, weight in taste.most_common(TOP_SUBJECTS):
+        for work in ol_subject_works(subject):
+            title = work.get("title", "")
+            key = _norm_title(title)
+            if not key or key in seed_titles:
+                continue
+            authors = [a.get("name", "") for a in work.get("authors", [])] or [""]
+            entry = candidates.setdefault(key, {
+                "title": title,
+                "author": authors[0],
+                "editions": work.get("edition_count", 0),
+                "cover_id": work.get("cover_id"),
+                "ol_key": work.get("key", ""),
+                "subjects": set(),
+                "score": 0.0,
+            })
+            entry["subjects"].add(subject)
+
+    # score: taste overlap + popularity prior. Two quality floors: an
+    # absolute one (must genuinely share subjects with the taste profile)
+    # and a relative one (top-heavy lists read better than padded ones).
+    overlaps = {
+        key: sum(min(taste.get(s, 0), 4.0) for s in entry["subjects"] if taste.get(s, 0))
+        for key, entry in candidates.items()
+    }
+    best = max(overlaps.values(), default=0.0)
+    scored = []
+    for key, entry in candidates.items():
+        overlap = overlaps[key]
+        if overlap < MIN_OVERLAP or overlap < best * REL_OVERLAP:
+            continue
+        entry["score"] = overlap + math.log10(int(entry["editions"] or 0) + 1)
+        scored.append(entry)
+
+    # reasons before sorting (needs subject sets), then order + diversify
+    top_subject_names = [s for s, _ in taste.most_common(TOP_SUBJECTS)]
+    for entry in scored:
+        matched = [s for s in top_subject_names if s in entry["subjects"]]
+        entry["why"] = _reason_phrase(entry, matched, seeds_with_subjects)
+
+    ranked = sorted(scored, key=lambda e: e["score"], reverse=True)
+    recs, per_author = [], Counter()
+    for entry in ranked:
+        if per_author[entry["author"].lower()] >= 2:
+            continue
+        per_author[entry["author"].lower()] += 1
+        entry["subjects"] = sorted(entry["subjects"])[:5]
+        recs.append(entry)
+        if len(recs) >= MAX_RECS:
+            break
+
+    return {
+        "taste": taste.most_common(TOP_SUBJECTS),
+        "recs": recs,
+        "matched": [s["title"] for s in seeds_with_subjects],
+        "unmatched": unmatched,
+        "reason": "ok",
+    }
+
+
+def _reason_phrase(entry: dict, matched: list[str], seeds: list[dict]) -> str:
+    bits = []
+    if matched:
+        joined = ", ".join(matched[:2])
+        bits.append(f"Matches your taste for {joined}")
+    # name a seed book that shares a subject with this candidate
+    for seed in seeds:
+        shared = [s for s in seed["subjects"] if s in entry["subjects"]]
+        if shared:
+            bits.append(f"you liked {seed['title']} ({shared[0]})")
+            break
+    if entry["editions"] > 100:
+        bits.append(f"a widely-read work ({entry['editions']} editions)")
+    return "; ".join(bits) if bits else "Rounds out the mix from your shelves"
+
+
+# --------------------------------------------------------------------------
+# Rate limiting
+# --------------------------------------------------------------------------
+
+def rate_ok(ip: str, now: float | None = None) -> bool:
+    now = now if now is not None else time.time()
+    with _rate_lock:
+        hits = [t for t in _rate.get(ip, []) if now - t < RATE_WINDOW]
+        if len(hits) >= RATE_MAX:
+            _rate[ip] = hits
+            return False
+        hits.append(now)
+        _rate[ip] = hits
+        if len(_rate) > 5000:  # crude memory guard
+            _rate.clear()
+        return True
+
+
+# --------------------------------------------------------------------------
+# API orchestration
+# --------------------------------------------------------------------------
+
+def recommend_from_profile(url: str) -> dict:
+    canonical = parse_profile_url(url)
+    if not canonical:
+        return {"error": "That doesn't look like a Goodreads profile link. "
+                         "It should look like https://www.goodreads.com/user/show/12345"}
+    ckey = "profile-" + canonical.rsplit("/", 1)[-1]
+    parsed = _cache_get(ckey, PROFILE_TTL)
+    if parsed is None:
+        try:
+            html = fetch_url(canonical).decode("utf-8", "replace")
+        except Exception as exc:
+            return {"error": f"Couldn't reach Goodreads right now ({exc.__class__.__name__}). Try again in a moment."}
+        parsed = extract_books(html)
+        _cache_put(ckey, parsed)
+    if parsed.get("signin"):
+        return {"error": "Goodreads asked us to sign in for that profile — it's probably private."}
+    if not parsed["books"]:
+        return {
+            "error": "No public books found on that profile. Their favorites and "
+                     "currently-reading shelves may be private — try the manual option below.",
+        }
+    result = recommend(parsed["books"])
+    result["profile_name"] = parsed.get("name")
+    return result
+
+
+def recommend_from_titles(titles: list[str]) -> dict:
+    seeds = []
+    for raw in titles:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        # allow "Title - Author", "Title by Author", or bare "Title"
+        m = re.split(r"\s+by\s+| - ", raw, maxsplit=1)
+        seed = {"title": m[0].strip(), "author": m[1].strip() if len(m) > 1 else "", "source": "manual"}
+        seeds.append(seed)
+    seeds = seeds[:8]
+    if len(seeds) < 1:
+        return {"error": "Add at least one book you love."}
+    return recommend(seeds)
+
+
+# --------------------------------------------------------------------------
+# HTTP layer
+# --------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ShelfMate/1.0"
+
+    def log_message(self, fmt, *args):  # privacy: no URLs/query strings in logs
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args if False else ""))
+
+    def _send(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if ctype.startswith("application/json") else "max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code: int, obj: dict):
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            with open(os.path.join(ROOT, "index.html"), "rb") as f:
+                self._send(200, f.read(), "text/html; charset=utf-8")
+        elif self.path == "/healthz":
+            self._json(200, {"ok": True})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/recommend":
+            self._json(404, {"error": "not found"})
+            return
+        ip = self.client_address[0]
+        if not rate_ok(ip):
+            self._json(429, {"error": "Too many requests — give it a minute."})
+            return
+        try:
+            length = min(int(self.headers.get("Content-Length", 0)), 10_000)
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            self._json(400, {"error": "Malformed request."})
+            return
+        if "url" in payload:
+            result = recommend_from_profile(payload["url"])
+        elif "books" in payload:
+            result = recommend_from_titles(payload.get("books") or [])
+        else:
+            result = {"error": "Send {\"url\": ...} or {\"books\": [...]}"}
+        code = 200 if "error" not in result else 400
+        self._json(code, result)
+
+
+def main():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"shelfmate listening on 127.0.0.1:{PORT}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
