@@ -46,6 +46,47 @@
   }
   #status { text-align: center; padding: 22px 8px; color: var(--muted); font-style: italic; display: none; }
   .error { color: var(--err); }
+
+  /* loading screen */
+  .loader {
+    max-width: 560px; margin: 30px auto 6px; text-align: center;
+    background: var(--panel); border: 1px solid #2a2e3a; border-radius: 12px;
+    padding: 26px 26px 20px;
+  }
+  .shelfrow {
+    display: flex; align-items: flex-end; justify-content: center; gap: 3px;
+    min-height: 60px; padding: 0 10px;
+    border-bottom: 7px solid #3b2f24; border-radius: 0 0 2px 2px;
+    box-shadow: 0 7px 10px -7px rgba(0,0,0,.7);
+    margin-bottom: 14px;
+  }
+  .spine {
+    border-radius: 2px 2px 0 0; position: relative;
+    animation: pop .5s cubic-bezier(.2,1.6,.4,1);
+  }
+  .spine::before {          /* little label band */
+    content: ''; position: absolute; top: 22%; left: 2px; right: 2px;
+    height: 3px; border-radius: 1px; background: rgba(255,255,255,.30);
+  }
+  @keyframes pop { 0% { transform: scaleY(.15) translateY(12px); opacity: 0; }
+                   100% { transform: none; opacity: 1; } }
+  .bar {
+    height: 7px; background: var(--bg); border: 1px solid #2a2e3a;
+    border-radius: 4px; overflow: hidden; margin-top: 6px;
+  }
+  .fill {
+    height: 100%; width: 0%; border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent));
+    background-size: 200% 100%; animation: shimmer 2.2s linear infinite;
+    transition: width .5s ease;
+  }
+  @keyframes shimmer { 0% { background-position: 0 0; } 100% { background-position: -200% 0; } }
+  .lstat { margin-top: 15px; font-style: italic; font-size: .98rem; transition: opacity .38s; }
+  .lmeta { margin-top: 6px; color: var(--muted); font-size: .8rem; font-family: system-ui, sans-serif; }
+  #loader { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .spine { animation: none; } .fill { animation: none; transition: none; }
+  }
   #taste { margin: 26px 0 8px; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .chip {
@@ -92,6 +133,13 @@
     <button class="go" onclick="addRow()" style="background:var(--panel2);color:var(--text);border:1px solid #333846">+ add another book</button>
     <button class="go" onclick="goManual()">Find my next read</button>
     <div class="hint">One per box — "Title" or "Title by Author". Two or three is plenty.</div>
+  </div>
+
+  <div id="loader" class="loader">
+    <div class="shelfrow" id="shelfrow"></div>
+    <div class="bar"><div class="fill" id="lfill"></div></div>
+    <div class="lstat" id="lstat">Consulting the librarian…</div>
+    <div class="lmeta"><span id="lmeta">Estimating…</span> · <span id="ltimer">0:00</span></div>
   </div>
 
   <div id="status"></div>
@@ -142,13 +190,20 @@ async function goManual() {
   await run({books});
 }
 
+// Resolve the API relative to where this page is mounted. The app can be
+// served at "/" (local dev) or under a proxy prefix like "/shelfmate"
+// (tailscale funnel), and an absolute "/api/..." would escape the prefix.
+const API_BASE = location.pathname
+  .replace(/(?:^|\/)index\.html$/, '')
+  .replace(/\/+$/, '');
+
 async function run(payload) {
   clearResults();
   const btns = document.querySelectorAll('button.go');
   btns.forEach(b => b.disabled = true);
-  status('Reading the shelves… this takes 10–20 seconds.');
+  status('Reading every book on the shelf… up to a minute for big libraries.');
   try {
-    const r = await fetch('/api/recommend', {
+    const r = await fetch(API_BASE + '/api/recommend', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
@@ -169,7 +224,8 @@ function render(data, wasUrl) {
   }
   const who = data.profile_name ? esc(data.profile_name) + "'s taste" : 'your taste';
   const matched = data.matched ? data.matched.length : 0;
-  let meta = 'Based on ' + matched + ' book' + (matched === 1 ? '' : 's') + ' from ' + who;
+  const total = data.shelf_total || matched;
+  let meta = 'Based on ' + total + ' book' + (total === 1 ? '' : 's') + ' from ' + who;
   if (data.unmatched && data.unmatched.length) meta += ' · ' + data.unmatched.length + ' title' + (data.unmatched.length===1?'':'s') + ' couldn\u2019t be matched';
   $('status').innerHTML = ''; $('status').style.display = 'none';
   const grid = document.createElement('div'); grid.className = 'grid';

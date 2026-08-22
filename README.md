@@ -1,31 +1,38 @@
 # ShelfMate 📚
 
+[![CI](https://github.com/pkia/shelfmate/actions/workflows/ci.yml/badge.svg)](https://github.com/pkia/shelfmate/actions/workflows/ci.yml)
+
 Paste a Goodreads profile link, get book recommendations. No account, no
 tracking, no stored profiles — anonymous for everyone.
 
-**Try it:** &lt;live URL&gt;
+**Try it:** https://
 
 ## How it works
 
 ```
-Goodreads profile link ──▶ Pi fetches public profile page
-                             (favorites + currently-reading)
+Goodreads profile link ──▶ Pi fetches public profile page (name, favorites)
+                          ──▶ whole public shelf via RSS feed (with ratings)
+                          ──▶ every shelf book a seed (favorites first)
                           ──▶ Open Library subject lookups (parallel)
-                          ──▶ taste profile (weighted subjects)
+                          ──▶ taste profile (subjects weighted by your ratings)
                           ──▶ candidate works from top subjects
                           ──▶ scored: subject overlap + popularity
                           ──▶ 12 recommendations, each with a reason
 ```
 
-1. **Goodreads profile pages are public** and fetch fine server-side
-   (shelf/RSS pages are login-walled, so those aren't used).
+1. **Goodreads RSS shelf feeds are public** (`/review/list_rss/<id>`,
+   100 books/page): the whole library with your own star ratings, no login
+   needed. The web shelf pages (`/review/list`) are login-walled, so the
+   RSS feed is the primary source; the profile page supplies the display
+   name, favorites, and total library size.
 2. Seed books are matched on **Open Library** to pull their subject tags.
-3. A **taste profile** is built from those subjects (favorites weighted
-   over currently-reading), with catalogue noise ("protected daisy",
-   "in library", …) filtered out.
+3. A **taste profile** is built from those subjects — books you rated 5★
+   count double, 1★ books barely count — with catalogue noise ("protected
+   daisy", "in library", …) filtered out.
 4. Candidates come from Open Library's per-subject work lists, scored on
    subject overlap (absolute + relative floors) plus an edition-count
-   popularity prior, capped at two books per author.
+   popularity prior, capped at two books per author. Books already on
+   your shelf are excluded — no recommending what you've read.
 5. Every recommendation carries a **human-readable reason**.
 
 If a profile has no public books, ShelfMate falls back to a manual mode:

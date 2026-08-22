@@ -3,7 +3,8 @@
 
 Anonymous, no accounts, no tracking. Runs on a Raspberry Pi behind a
 Tailscale funnel. Data sources:
-  - Goodreads public profile pages (favorites + currently reading)
+  - Goodreads RSS shelf feed (the user's whole public library + ratings)
+  - Goodreads public profile page (name + favorite books, fallback)
   - Open Library (subjects, similar works, covers)
 
 Stdlib only. See README.md for the architecture notes.
@@ -171,6 +172,89 @@ def extract_books(html: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Goodreads RSS shelf feed: the user's WHOLE public library, anonymously
+# --------------------------------------------------------------------------
+# review/list_rss/<id> serves the full shelf (100 books/page, paginated),
+# with per-book ratings, without requiring a login — unlike /review/list
+# which redirects to sign-in. Primary source; the profile page above is
+# the fallback (and supplies the display name + favorites).
+
+RSS_PAGE_SIZE = 100
+RSS_MAX_PAGES = 5               # 500 books is plenty of taste signal
+
+
+def _rss_text(block: str, tag: str) -> str:
+    m = re.search(rf"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>", block, re.S)
+    return html_mod.unescape(m.group(1)).strip() if m else ""
+
+
+def parse_rss(xml: str) -> list[dict]:
+    """Parse one Goodreads list_rss page into seed books with ratings."""
+    books, seen = [], set()
+    for block in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        title = _rss_text(block, "title")
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        books.append({
+            "title": title,
+            "author": _rss_text(block, "author_name"),
+            "rating": _rss_text(block, "user_rating"),
+            "source": "shelf",
+        })
+    return books
+
+
+def fetch_shelf_rss(user_id: str, shelf: str = "") -> list[dict]:
+    """Pull the user's whole public shelf via review/list_rss, all pages."""
+    books, seen = [], set()
+    for page in range(1, RSS_MAX_PAGES + 1):
+        url = f"https://www.goodreads.com/review/list_rss/{user_id}"
+        if shelf:
+            url += f"?shelf={shelf}&page={page}"
+        else:
+            url += f"?page={page}"
+        got = parse_rss(fetch_url(url, timeout=20).decode("utf-8", "replace"))
+        fresh = [b for b in got if b["title"].lower() not in seen]
+        seen.update(b["title"].lower() for b in fresh)
+        books.extend(fresh)
+        if len(got) < RSS_PAGE_SIZE:
+            break
+    return books
+
+
+def _pick_seeds(shelf: list[dict], favorites: list[dict], cap: int | None = None) -> list[dict]:
+    """All shelf books as seeds, favorites first, then high-rated, then recent.
+
+    Favorites are the user's explicit picks (higher taste weight); ratings
+    tell us how much a shelf book actually mattered; the feed is
+    newest-first, so unrated books keep a recency order. `cap` is only
+    used by callers that must bound work (tests, fallbacks).
+    """
+    def rating(b: dict) -> int:
+        try:
+            return int(b.get("rating") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked = sorted(shelf, key=lambda b: -rating(b))   # stable: unrated stay newest-first
+    fav_titles = {b["title"].lower() for b in favorites}
+    picked = favorites + [b for b in ranked if b["title"].lower() not in fav_titles]
+    return picked if cap is None else picked[:cap]
+
+
+def extract_library_size(html: str) -> int | None:
+    """'"Jane Doe (156 books)"' -> 156, from the profile page title."""
+    m = re.search(r"\(([\d,]+)\s+books?\)", html, re.I)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+# --------------------------------------------------------------------------
 # Open Library client (with on-disk cache)
 # --------------------------------------------------------------------------
 
@@ -294,19 +378,37 @@ def _clean_subjects(raw: list[str]) -> list[str]:
     return out
 
 
+def seed_weight(seed: dict) -> float:
+    """How strongly a seed book should drive the taste profile.
+
+    Favorites are explicit picks (1.5). Shelf books scale with the user's
+    own rating: 1★→0.8, 3★→1.4, 5★→2.0; unrated shelf books are neutral.
+    """
+    if seed.get("source") == "favorite":
+        return 1.5
+    r = str(seed.get("rating") or "0").strip()
+    if r.isdigit() and int(r) > 0:
+        return 0.5 + int(r) * 0.3
+    return 1.0
+
+
 def build_taste(seeds_with_subjects: list[dict]) -> Counter:
     taste = Counter()
     for seed in seeds_with_subjects:
-        weight = 1.5 if seed.get("source") == "favorite" else 1.0
+        weight = seed_weight(seed)
         for s in seed["subjects"]:
             taste[s] += weight
     return taste
 
 
-def recommend(seeds: list[dict]) -> dict:
-    """seeds: [{title, author?, source?}] -> {taste, recs, matched, unmatched}"""
+def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dict:
+    """seeds: [{title, author?, source?, rating?}] -> {taste, recs, matched, unmatched}
+
+    exclude_titles: books to never recommend (e.g. the user's whole shelf,
+    not just the seed subset) — no point suggesting what they already read.
+    """
     # Look up all seeds on Open Library in parallel (6 workers is polite
-    # to the free API and plenty for MAX_SEEDS=30).
+    # to the free API and plenty for a full shelf).
     with ThreadPoolExecutor(max_workers=6) as pool:
         docs = list(pool.map(
             lambda s: ol_find_work(s["title"], s.get("author", "")), seeds))
@@ -322,7 +424,8 @@ def recommend(seeds: list[dict]) -> dict:
         return {"taste": {}, "recs": [], "matched": [], "unmatched": unmatched, "reason": "no_match"}
 
     taste = build_taste(seeds_with_subjects)
-    seed_titles = {_norm_title(s["title"]) for s in seeds_with_subjects}
+    library = {_norm_title(s["title"]) for s in seeds}
+    library.update(_norm_title(t) for t in (exclude_titles or []) if t)
 
     candidates: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=6) as pool:
@@ -332,7 +435,7 @@ def recommend(seeds: list[dict]) -> dict:
         for work in works:
             title = work.get("title", "")
             key = _norm_title(title)
-            if not key or key in seed_titles:
+            if not key or key in library:
                 continue
             authors = [a.get("name", "") for a in work.get("authors", [])] or [""]
             entry = candidates.setdefault(key, {
@@ -431,24 +534,48 @@ def recommend_from_profile(url: str) -> dict:
     if not canonical:
         return {"error": "That doesn't look like a Goodreads profile link. "
                          "It should look like https://www.goodreads.com/user/show/12345"}
-    ckey = "profile-" + canonical.rsplit("/", 1)[-1]
+    user_id = canonical.rsplit("/", 1)[-1]
+    ckey = "profile-" + user_id
     parsed = _cache_get(ckey, PROFILE_TTL)
     if parsed is None:
+        # 1) Profile page: display name + favorites (cheap, one request).
         try:
             html = fetch_url(canonical).decode("utf-8", "replace")
         except Exception as exc:
             return {"error": f"Couldn't reach Goodreads right now ({exc.__class__.__name__}). Try again in a moment."}
-        parsed = extract_books(html)
+        name = extract_name(html)
+        signin = looks_like_signin(html)
+        favorites = [] if signin else _alt_books(html)
+        library_size = None if signin else extract_library_size(html)
+
+        # 2) Whole shelf via the public RSS feed (paginated, has ratings).
+        shelf: list[dict] = []
+        if not signin:
+            try:
+                shelf = fetch_shelf_rss(user_id)
+            except Exception:
+                shelf = []   # fall back to favorites below
+
+        parsed = {
+            "name": name,
+            "signin": signin,
+            "library_size": library_size,
+            "books": _pick_seeds(shelf, favorites),
+            "shelf_titles": [b["title"] for b in shelf],
+        }
         _cache_put(ckey, parsed)
     if parsed.get("signin"):
         return {"error": "Goodreads asked us to sign in for that profile — it's probably private."}
     if not parsed["books"]:
         return {
-            "error": "No public books found on that profile. Their favorites and "
-                     "currently-reading shelves may be private — try the manual option below.",
+            "error": "No public books found on that profile. Their shelves may be "
+                     "private — try the manual option below.",
         }
-    result = recommend(parsed["books"])
+
+    result = recommend(parsed["books"], exclude_titles=parsed.get("shelf_titles") or [])
     result["profile_name"] = parsed.get("name")
+    result["library_size"] = parsed.get("library_size")
+    result["shelf_total"] = len(parsed.get("shelf_titles") or [])
     return result
 
 
