@@ -153,7 +153,7 @@ async function run(payload) {
   clearResults();
   const btns = document.querySelectorAll('button.go');
   btns.forEach(b => b.disabled = true);
-  status('Reading the shelves… this takes 10–20 seconds.');
+  status('Reading every book on the shelf… up to a minute for big libraries.');
   try {
     const r = await fetch(API_BASE + '/api/recommend', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -178,9 +178,7 @@ function render(data, wasUrl) {
   const matched = data.matched ? data.matched.length : 0;
   const total = data.shelf_total || matched;
   let meta = 'Based on ' + total + ' book' + (total === 1 ? '' : 's') + ' from ' + who;
-  if (data.shelf_total && matched && matched < data.shelf_total) {
-    meta += ' — top ' + matched + ' analysed in depth';
-  } else if (data.unmatched && data.unmatched.length) meta += ' · ' + data.unmatched.length + ' title' + (data.unmatched.length===1?'':'s') + ' couldn\u2019t be matched';
+  if (data.unmatched && data.unmatched.length) meta += ' · ' + data.unmatched.length + ' title' + (data.unmatched.length===1?'':'s') + ' couldn\u2019t be matched';
   $('status').innerHTML = ''; $('status').style.display = 'none';
   const grid = document.createElement('div'); grid.className = 'grid';
   data.recs.forEach(b => {

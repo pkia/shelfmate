@@ -223,12 +223,13 @@ def fetch_shelf_rss(user_id: str, shelf: str = "") -> list[dict]:
     return books
 
 
-def _pick_seeds(shelf: list[dict], favorites: list[dict], cap: int) -> list[dict]:
-    """Best-of selection: favorites first, then high-rated, then recent.
+def _pick_seeds(shelf: list[dict], favorites: list[dict], cap: int | None = None) -> list[dict]:
+    """All shelf books as seeds, favorites first, then high-rated, then recent.
 
-    Favorites are the user's explicit picks; ratings tell us how much a
-    shelf book actually mattered to them; the feed is newest-first, so
-    unrated books keep a recency order.
+    Favorites are the user's explicit picks (higher taste weight); ratings
+    tell us how much a shelf book actually mattered; the feed is
+    newest-first, so unrated books keep a recency order. `cap` is only
+    used by callers that must bound work (tests, fallbacks).
     """
     def rating(b: dict) -> int:
         try:
@@ -239,7 +240,7 @@ def _pick_seeds(shelf: list[dict], favorites: list[dict], cap: int) -> list[dict
     ranked = sorted(shelf, key=lambda b: -rating(b))   # stable: unrated stay newest-first
     fav_titles = {b["title"].lower() for b in favorites}
     picked = favorites + [b for b in ranked if b["title"].lower() not in fav_titles]
-    return picked[:cap]
+    return picked if cap is None else picked[:cap]
 
 
 def extract_library_size(html: str) -> int | None:
@@ -407,7 +408,7 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
     not just the seed subset) — no point suggesting what they already read.
     """
     # Look up all seeds on Open Library in parallel (6 workers is polite
-    # to the free API and plenty for MAX_SEEDS=30).
+    # to the free API and plenty for a full shelf).
     with ThreadPoolExecutor(max_workers=6) as pool:
         docs = list(pool.map(
             lambda s: ol_find_work(s["title"], s.get("author", "")), seeds))
@@ -559,7 +560,7 @@ def recommend_from_profile(url: str) -> dict:
             "name": name,
             "signin": signin,
             "library_size": library_size,
-            "books": _pick_seeds(shelf, favorites, MAX_SEEDS),
+            "books": _pick_seeds(shelf, favorites),
             "shelf_titles": [b["title"] for b in shelf],
         }
         _cache_put(ckey, parsed)

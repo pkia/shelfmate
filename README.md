@@ -12,7 +12,7 @@ tracking, no stored profiles — anonymous for everyone.
 ```
 Goodreads profile link ──▶ Pi fetches public profile page (name, favorites)
                           ──▶ whole public shelf via RSS feed (with ratings)
-                          ──▶ best ~30 seeds: favorites, then top ratings
+                          ──▶ every shelf book a seed (favorites first)
                           ──▶ Open Library subject lookups (parallel)
                           ──▶ taste profile (subjects weighted by your ratings)
                           ──▶ candidate works from top subjects
