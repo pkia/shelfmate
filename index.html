@@ -46,6 +46,47 @@
   }
   #status { text-align: center; padding: 22px 8px; color: var(--muted); font-style: italic; display: none; }
   .error { color: var(--err); }
+
+  /* loading screen */
+  .loader {
+    max-width: 560px; margin: 30px auto 6px; text-align: center;
+    background: var(--panel); border: 1px solid #2a2e3a; border-radius: 12px;
+    padding: 26px 26px 20px;
+  }
+  .shelfrow {
+    display: flex; align-items: flex-end; justify-content: center; gap: 3px;
+    min-height: 60px; padding: 0 10px;
+    border-bottom: 7px solid #3b2f24; border-radius: 0 0 2px 2px;
+    box-shadow: 0 7px 10px -7px rgba(0,0,0,.7);
+    margin-bottom: 14px;
+  }
+  .spine {
+    border-radius: 2px 2px 0 0; position: relative;
+    animation: pop .5s cubic-bezier(.2,1.6,.4,1);
+  }
+  .spine::before {          /* little label band */
+    content: ''; position: absolute; top: 22%; left: 2px; right: 2px;
+    height: 3px; border-radius: 1px; background: rgba(255,255,255,.30);
+  }
+  @keyframes pop { 0% { transform: scaleY(.15) translateY(12px); opacity: 0; }
+                   100% { transform: none; opacity: 1; } }
+  .bar {
+    height: 7px; background: var(--bg); border: 1px solid #2a2e3a;
+    border-radius: 4px; overflow: hidden; margin-top: 6px;
+  }
+  .fill {
+    height: 100%; width: 0%; border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent));
+    background-size: 200% 100%; animation: shimmer 2.2s linear infinite;
+    transition: width .5s ease;
+  }
+  @keyframes shimmer { 0% { background-position: 0 0; } 100% { background-position: -200% 0; } }
+  .lstat { margin-top: 15px; font-style: italic; font-size: .98rem; transition: opacity .38s; }
+  .lmeta { margin-top: 6px; color: var(--muted); font-size: .8rem; font-family: system-ui, sans-serif; }
+  #loader { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .spine { animation: none; } .fill { animation: none; transition: none; }
+  }
   #taste { margin: 26px 0 8px; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .chip {
@@ -94,6 +135,13 @@
     <div class="hint">One per box — "Title" or "Title by Author". Two or three is plenty.</div>
   </div>
 
+  <div id="loader" class="loader">
+    <div class="shelfrow" id="shelfrow"></div>
+    <div class="bar"><div class="fill" id="lfill"></div></div>
+    <div class="lstat" id="lstat">Consulting the librarian…</div>
+    <div class="lmeta"><span id="lmeta">Estimating…</span> · <span id="ltimer">0:00</span></div>
+  </div>
+
   <div id="status"></div>
   <div id="taste" class="hidden"><div class="chips" id="chips"></div></div>
   <div id="results"></div>
@@ -131,6 +179,88 @@ addRow(); addRow(); addRow();
 function status(html) { const s = $('status'); s.innerHTML = html; s.style.display = 'block'; }
 function clearResults() { $('status').style.display='none'; $('taste').classList.add('hidden'); $('results').innerHTML=''; }
 
+// ---------- loading screen ----------
+const SPINE_COLORS = ['#c0563f','#3f7ec0','#4f9e5c','#c9a13b','#8a6ac0','#c06aa5','#4fb8ab','#b5734a'];
+const PHASES = [
+  [0,  10, 'Fetching your shelves from Goodreads…'],
+  [2,  24, 'Skimming every spine on the shelf…'],
+  [6,  46, 'Matching titles with Open Library…'],
+  [16, 84, 'Reading the subject tags…'],
+  [30, 94, 'Debating your taste with the librarian…'],
+];
+const FLAVOR = [
+  'Still debating with the librarian…',
+  'Cross-referencing the 3×5 cards…',
+  'Dusting off the classics section…',
+  'Shhh — reading in progress…',
+  'Checking what your favourites share…',
+  'Definitely not judging your five-star picks…',
+];
+let loadCtl = null;
+
+function startLoader() {
+  stopLoader();
+  $('loader').style.display = 'block';
+  const row = $('shelfrow'); row.innerHTML = '';
+  $('lfill').style.width = '0%';
+  $('lmeta').textContent = 'usually a few seconds · up to ~45s the first time we read this shelf';
+  const ls = $('lstat'); ls.textContent = PHASES[0][2]; ls.dataset.line = ls.textContent;
+  const t0 = performance.now();
+  let spineN = 0, flavorI = 0, flaggedBig = false;
+
+  function addSpine() {
+    if (spineN >= 26 || !row.isConnected) return;
+    const b = document.createElement('div');
+    b.className = 'spine';
+    b.style.height = (26 + Math.random() * 34).toFixed(0) + 'px';
+    b.style.width  = (9 + Math.random() * 5).toFixed(0) + 'px';
+    b.style.background = SPINE_COLORS[Math.floor(Math.random() * SPINE_COLORS.length)];
+    if (spineN % 6 === 5) b.style.transform = 'rotate(-5deg)';   // the one leaning book
+    row.appendChild(b);
+    spineN++;
+  }
+
+  function tick() {
+    const el = (performance.now() - t0) / 1000;
+    const s = Math.floor(el);
+    $('ltimer').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    let pct = PHASES[0][1], line = PHASES[0][2];
+    for (const [at, p, l] of PHASES) if (el >= at) { pct = p; line = l; }
+    if (el > 36) {   // past every honest phase — rotate flavor and creep toward 99%
+      pct = 94 + Math.min(5, (el - 36) / 22);
+      if (el - (tick.lastFlavor || 36) > 5) { tick.lastFlavor = el; line = FLAVOR[flavorI++ % FLAVOR.length]; }
+    }
+    $('lfill').style.width = Math.min(99, pct + (Math.random() * .6 - .3)).toFixed(1) + '%';
+    if (ls.dataset.line !== line) {
+      ls.dataset.line = line;
+      ls.style.opacity = 0;
+      setTimeout(() => { ls.textContent = line; ls.style.opacity = 1; }, 200);
+    }
+    if (!flaggedBig && el > 12) {
+      flaggedBig = true;
+      $('lmeta').textContent = 'big shelf — usually done within a minute, worth the wait';
+    }
+    loadCtl.tickId = setTimeout(tick, 250);
+  }
+
+  addSpine();
+  loadCtl = {
+    spineId: setInterval(addSpine, 340),
+    tickId: 0,
+  };
+  tick();
+}
+
+function stopLoader(done) {
+  if (loadCtl) { clearInterval(loadCtl.spineId); clearTimeout(loadCtl.tickId); loadCtl = null; }
+  if (done) {
+    $('lfill').style.width = '100%';
+    setTimeout(() => { $('loader').style.display = 'none'; }, 220);
+  } else {
+    $('loader').style.display = 'none';
+  }
+}
+
 async function go() {
   const url = $('grurl').value.trim();
   if (!url) { status('<span class="error">Paste your Goodreads profile link first.</span>'); return; }
@@ -153,16 +283,18 @@ async function run(payload) {
   clearResults();
   const btns = document.querySelectorAll('button.go');
   btns.forEach(b => b.disabled = true);
-  status('Reading every book on the shelf… up to a minute for big libraries.');
+  startLoader();
   try {
     const r = await fetch(API_BASE + '/api/recommend', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
     const data = await r.json();
+    stopLoader(true);
     if (data.error) { status('<span class="error">' + data.error + '</span>'); return; }
     render(data, payload.url);
   } catch (e) {
+    stopLoader(false);
     status('<span class="error">Something went wrong — try again in a moment.</span>');
   } finally {
     btns.forEach(b => b.disabled = false);
