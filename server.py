@@ -384,16 +384,18 @@ def ol_subject_works(subject: str, limit: int = 30) -> list[dict]:
 
 
 def ol_recent_by_subject(subject: str, limit: int = 15) -> list[dict]:
-    """Recent works for a taste subject via search.json (sort=new).
+    """Recent works for a taste subject via search.json.
 
-    The /subjects endpoint ranks by editions, so it buries new releases;
-    search.json sorts by first-publish date and supports subject: +
-    first_publish_year filters. Fields normalised to match /subjects
-    works so both sources feed one candidate pool.
+    The /subjects endpoint ranks by editions, so it buries new releases.
+    A first_publish_year range filter with the default ranking sort
+    surfaces real recent releases — sort=new instead returns the
+    self-published tail, so we don't use it. Fields normalised to match
+    /subjects works so both sources feed one candidate pool.
     """
+    year_to = _current_year()
+    year_from = year_to - RECENT_WINDOW_YEARS
     params = urllib.parse.urlencode({
-        "q": f'subject:"{subject}"',
-        "sort": "new",
+        "q": f'subject:"{subject}" AND first_publish_year:[{year_from} TO {year_to}]',
         "fields": "key,title,author_name,first_publish_year,edition_count,subject,cover_i",
         "per_page": limit,
     })
@@ -406,9 +408,9 @@ def ol_recent_by_subject(subject: str, limit: int = 15) -> list[dict]:
     for doc in data.get("docs") or []:
         year = doc.get("first_publish_year")
         if not isinstance(year, int):
-            continue  # sort=new surfaces undated scans; skip them
-        if _current_year() - year > RECENT_WINDOW_YEARS:
             continue
+        if not (year_from <= year <= year_to):
+            continue  # defensive: server-side range already filters
         authors = doc.get("author_name") or [""]
         out.append({
             "title": doc.get("title", ""),
