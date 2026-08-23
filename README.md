@@ -15,8 +15,8 @@ Goodreads profile link ──▶ Pi fetches public profile page (name, favorites
                           ──▶ every shelf book a seed (favorites first)
                           ──▶ Open Library subject lookups (parallel)
                           ──▶ taste profile (subjects weighted by your ratings)
-                          ──▶ candidate works from top subjects
-                          ──▶ scored: subject overlap + popularity
+                          ──▶ candidates: subject canon + new releases (≤5y)
+                          ──▶ scored: subject overlap + capped popularity + recency
                           ──▶ 12 recommendations, each with a reason
 ```
 
@@ -29,10 +29,15 @@ Goodreads profile link ──▶ Pi fetches public profile page (name, favorites
 3. A **taste profile** is built from those subjects — books you rated 5★
    count double, 1★ books barely count — with catalogue noise ("protected
    daisy", "in library", …) filtered out.
-4. Candidates come from Open Library's per-subject work lists, scored on
-   subject overlap (absolute + relative floors) plus an edition-count
-   popularity prior, capped at two books per author. Books already on
-   your shelf are excluded — no recommending what you've read.
+4. Candidates come from two pools: Open Library's per-subject work lists
+   (the subject canon) **and** `search.json` sorted by publish date for
+   recent releases (last 5 years) that carry a top taste subject. Scoring
+   is subject overlap (absolute + relative floors) + an edition-count
+   popularity prior **capped at 30 editions** + a recency bonus that fades
+   over ~15 years — so a brand-new book can outrank a 500-edition classic
+   on an equal match, but a strongly-matching classic still beats a
+   weakly-matching new release. Capped at two books per author; books
+   already on your shelf are excluded — no recommending what you've read.
 5. Every recommendation carries a **human-readable reason**.
 
 If a profile has no public books, ShelfMate falls back to a manual mode:

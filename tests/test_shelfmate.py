@@ -250,7 +250,7 @@ DOC = {
 }
 
 
-def _fake_ol(monkeypatch, docs_by_title, subject_works):
+def _fake_ol(monkeypatch, docs_by_title, subject_works, recent=None):
     def find(title, author=""):
         for t, d in docs_by_title.items():
             if server._norm_title(t) == server._norm_title(title):
@@ -259,6 +259,8 @@ def _fake_ol(monkeypatch, docs_by_title, subject_works):
 
     monkeypatch.setattr(server, "ol_find_work", find)
     monkeypatch.setattr(server, "ol_subject_works", lambda s, limit=30: subject_works.get(s, []))
+    monkeypatch.setattr(server, "ol_recent_by_subject",
+                        lambda s, limit=15: (recent or {}).get(s, []))
 
 
 def test_recommend_ranks_and_reasons(monkeypatch):
@@ -335,6 +337,119 @@ def test_seed_never_recommended_even_fuzzy(monkeypatch):
                            "edition_count": 10, "cover_id": None, "key": "/works/OL5W"}]})
     result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
     assert result["recs"] == []
+
+
+# ------------------------------------------------------ recency + ranking
+
+def test_recency_bonus_fades():
+    year_now = server._current_year()
+    assert server._recency_bonus(year_now) == server.RECENT_BONUS
+    assert 0 < server._recency_bonus(year_now - 7) < server.RECENT_BONUS
+    assert server._recency_bonus(year_now - 15) == 0.0
+    assert server._recency_bonus(year_now - 90) == 0.0
+    assert server._recency_bonus(None) == 0.0
+
+
+def test_new_release_outranks_edition_giant(monkeypatch):
+    """The bug this fixes: only classics ever surfaced.
+
+    A new release matching MORE taste subjects must outrank the edition
+    giant — previously the 500-edition prior made that impossible.
+    """
+    doc = dict(DOC)  # seed: fantasy + magic + epic fiction
+    year_now = server._current_year()
+    giant = {  # /subjects canon pick: 500 editions, matches one subject
+        "title": "Wuthering Heights", "authors": [{"name": "Emily Brontë"}],
+        "edition_count": 500, "cover_id": 7, "key": "/works/OL7W",
+        "first_publish_year": 1850,
+    }
+    fresh = {  # search.json sort=new pick: 2 editions, matches two subjects
+        "title": "The Tainted Cup", "authors": [{"name": "Robert Jackson Bennett"}],
+        "edition_count": 2, "cover_id": 8, "key": "/works/OL8W",
+        "first_publish_year": year_now,
+        "subject": ["fantasy", "magic"],
+    }
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc},
+             {"fantasy": [giant]},
+             recent={"fantasy": [fresh]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    titles = [r["title"] for r in result["recs"]]
+    assert titles == ["The Tainted Cup", "Wuthering Heights"], titles
+    top = result["recs"][0]
+    assert top["first_publish_year"] == year_now
+    assert top["why"].startswith(f"New {year_now} release")
+
+
+def test_recency_beats_edition_count_on_equal_match(monkeypatch):
+    """Same taste overlap: capped prior + recency beat raw edition count."""
+    doc = dict(DOC)
+    year_now = server._current_year()
+    def book(title, key, editions, year):
+        return {"title": title, "authors": [{"name": "X"}], "edition_count": editions,
+                "cover_id": None, "key": key, "first_publish_year": year}
+    giant = book("Edition Giant", "/works/OL7W", 500, 1850)
+    fresh = book("Fresh Match", "/works/OL8W", 2, year_now)
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc},
+             {"fantasy": [giant], "magic": [giant], "epic fiction": [giant]},
+             recent={"fantasy": [fresh], "magic": [fresh], "epic fiction": [fresh]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    titles = [r["title"] for r in result["recs"]]
+    assert titles[0] == "Fresh Match", titles
+
+
+def test_stronger_taste_match_still_wins_over_recency(monkeypatch):
+    """Recency boosts, it doesn't trump: 3-subject classic beats 2-subject new."""
+    doc = dict(DOC)
+    year_now = server._current_year()
+    strong = {
+        "title": "Deep Match Classic", "authors": [{"name": "X"}],
+        "edition_count": 60, "cover_id": None, "key": "/works/OL7W",
+        "first_publish_year": 1960,
+    }
+    fresh = {
+        "title": "Shallow New Book", "authors": [{"name": "Y"}],
+        "edition_count": 2, "cover_id": None, "key": "/works/OL8W",
+        "first_publish_year": year_now,
+        "subject": ["fantasy"],
+    }
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc},
+             {"fantasy": [strong], "magic": [strong], "epic fiction": [strong]},
+             recent={"fantasy": [fresh]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    titles = [r["title"] for r in result["recs"]]
+    assert titles[0] == "Deep Match Classic", titles
+    assert "Shallow New Book" in titles  # but the new book still surfaces
+
+
+def test_recency_gives_subject_credit_from_search_doc(monkeypatch):
+    """search.json docs carry their own subjects — taste overlap counts them."""
+    doc = dict(DOC)
+    fresh = {
+        "title": "New Fantasy Book", "authors": [{"name": "Someone"}],
+        "edition_count": 1, "cover_id": None, "key": "/works/OL8W",
+        "first_publish_year": server._current_year(),
+        "subject": ["magic", "dragons"],   # only 'magic' was searched
+    }
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc},
+             {}, recent={"fantasy": [fresh]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    rec = next(r for r in result["recs"] if r["title"] == "New Fantasy Book")
+    assert "magic" in rec["subjects"]
+
+
+def test_ancient_book_no_recency_credit(monkeypatch):
+    """An undated or ancient work gets no floor help and no bonus."""
+    doc = dict(DOC)
+    old = {
+        "title": "Some 1920 Classic", "authors": [{"name": "X"}],
+        "edition_count": 40, "cover_id": None, "key": "/works/OL7W",
+        "first_publish_year": 1920,
+    }
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc},
+             {"fantasy": [old], "magic": [old], "epic fiction": [old]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    assert [r["title"] for r in result["recs"]] == ["Some 1920 Classic"]
+    assert "New" not in result["recs"][0]["why"]
 
 
 def test_subject_stoplist():

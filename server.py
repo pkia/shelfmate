@@ -55,6 +55,28 @@ TOP_SUBJECTS = 6
 MAX_RECS = 12
 MIN_OVERLAP = 0.99       # absolute floor: at least one shared subject of unit weight
 REL_OVERLAP = 0.35       # ...and keep only candidates within this fraction of the best match
+EDITIONS_PRIOR_CAP = 30  # popularity prior cap: 500-edition classics can't bank it
+RECENT_SUBJECTS = 3      # top-N taste subjects also searched for recent releases
+RECENT_WINDOW_YEARS = 5  # "recent" = first published within this many years
+RECENT_BONUS = 1.2       # max score bonus for a brand-new book (fades over ~15y)
+
+
+def _current_year() -> int:
+    return time.localtime().tm_year
+
+
+def _recency_bonus(year: int | None) -> float:
+    """Score boost for recent first-publication, fading to zero over ~15 years.
+
+    Keeps recommendations from collapsing into the most-reprinted classics
+    (Open Library's /subjects ranking is edition-heavy). Applied to the
+    quality floor too, so fresh releases clear it without lowering the
+    bar for everything else.
+    """
+    if not year:
+        return 0.0
+    age = max(0, _current_year() - int(year))
+    return RECENT_BONUS * max(0.0, 1.0 - age / 15.0)
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +383,44 @@ def ol_subject_works(subject: str, limit: int = 30) -> list[dict]:
         return []
 
 
+def ol_recent_by_subject(subject: str, limit: int = 15) -> list[dict]:
+    """Recent works for a taste subject via search.json (sort=new).
+
+    The /subjects endpoint ranks by editions, so it buries new releases;
+    search.json sorts by first-publish date and supports subject: +
+    first_publish_year filters. Fields normalised to match /subjects
+    works so both sources feed one candidate pool.
+    """
+    params = urllib.parse.urlencode({
+        "q": f'subject:"{subject}"',
+        "sort": "new",
+        "fields": "key,title,author_name,first_publish_year,edition_count,subject,cover_i",
+        "per_page": limit,
+    })
+    url = "https://openlibrary.org/search.json?" + params
+    try:
+        data = _ol_get(url)
+    except Exception:
+        return []
+    out = []
+    for doc in data.get("docs") or []:
+        year = doc.get("first_publish_year")
+        if not isinstance(year, int):
+            continue  # sort=new surfaces undated scans; skip them
+        if _current_year() - year > RECENT_WINDOW_YEARS:
+            continue
+        authors = doc.get("author_name") or [""]
+        out.append({
+            "title": doc.get("title", ""),
+            "authors": [{"name": a} for a in authors],
+            "edition_count": doc.get("edition_count", 0),
+            "cover_id": doc.get("cover_i"),
+            "key": doc.get("key", ""),
+            "first_publish_year": year,
+        })
+    return out
+
+
 # --------------------------------------------------------------------------
 # Recommender
 # --------------------------------------------------------------------------
@@ -427,11 +487,22 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
     library = {_norm_title(s["title"]) for s in seeds}
     library.update(_norm_title(t) for t in (exclude_titles or []) if t)
 
+    top_subjects = [s for s, _ in taste.most_common(TOP_SUBJECTS)]
+
+    # Candidate pool, two sources:
+    #   /subjects   — edition-ranked canon (matches taste, skews classic)
+    #   search.json sort=new — new releases carrying a top taste subject
     candidates: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=6) as pool:
         subject_lists = list(pool.map(
-            lambda sub: ol_subject_works(sub), [s for s, _ in taste.most_common(TOP_SUBJECTS)]))
-    for subject, works in zip([s for s, _ in taste.most_common(TOP_SUBJECTS)], subject_lists):
+            lambda sub: ol_subject_works(sub), top_subjects))
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        recent_lists = list(pool.map(
+            lambda sub: ol_recent_by_subject(sub),
+            top_subjects[:RECENT_SUBJECTS]))
+    source_pairs = (list(zip(top_subjects, subject_lists))
+                    + list(zip(top_subjects[:RECENT_SUBJECTS], recent_lists)))
+    for subject, works in source_pairs:
         for work in works:
             title = work.get("title", "")
             key = _norm_title(title)
@@ -444,14 +515,21 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
                 "editions": work.get("edition_count", 0),
                 "cover_id": work.get("cover_id"),
                 "ol_key": work.get("key", ""),
+                "first_publish_year": work.get("first_publish_year"),
                 "subjects": set(),
                 "score": 0.0,
             })
-            entry["subjects"].add(subject)
+            # search.json works carry their own subject list — credit every
+            # subject that carries taste weight, not just the searched one
+            extra = {s.strip().lower() for s in work.get("subject") or []}
+            for s in {subject} | extra:
+                if s in taste:
+                    entry["subjects"].add(s)
 
-    # score: taste overlap + popularity prior. Two quality floors: an
-    # absolute one (must genuinely share subjects with the taste profile)
-    # and a relative one (top-heavy lists read better than padded ones).
+    # score: taste overlap + capped popularity prior + recency. Two quality
+    # floors: an absolute one (must genuinely share taste) and a relative
+    # one (top-heavy lists read better than padded ones). The recency
+    # bonus counts toward the absolute floor so new releases can clear it.
     overlaps = {
         key: sum(min(taste.get(s, 0), 4.0) for s in entry["subjects"] if taste.get(s, 0))
         for key, entry in candidates.items()
@@ -460,9 +538,15 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
     scored = []
     for key, entry in candidates.items():
         overlap = overlaps[key]
-        if overlap < MIN_OVERLAP or overlap < best * REL_OVERLAP:
+        recency = _recency_bonus(entry.get("first_publish_year"))
+        # the recency bonus lets genuinely-shared-subject new releases
+        # clear both quality floors — without lowering them for old junk
+        adj = overlap + recency
+        if adj < MIN_OVERLAP or adj < best * REL_OVERLAP:
             continue
-        entry["score"] = overlap + math.log10(int(entry["editions"] or 0) + 1)
+        entry["score"] = (overlap
+                          + math.log10(min(int(entry["editions"] or 0), EDITIONS_PRIOR_CAP) + 1)
+                          + recency)
         scored.append(entry)
 
     # reasons before sorting (needs subject sets), then order + diversify
@@ -493,9 +577,12 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
 
 def _reason_phrase(entry: dict, matched: list[str], seeds: list[dict]) -> str:
     bits = []
+    year = entry.get("first_publish_year")
+    if isinstance(year, int) and _current_year() - year <= RECENT_WINDOW_YEARS:
+        bits.append(f"New {year} release")
     if matched:
         joined = ", ".join(matched[:2])
-        bits.append(f"Matches your taste for {joined}")
+        bits.append(f"matches your taste for {joined}")
     # name a seed book that shares a subject with this candidate
     for seed in seeds:
         shared = [s for s in seed["subjects"] if s in entry["subjects"]]

@@ -103,6 +103,7 @@
   .card h3 { margin: 0; font-size: 1rem; font-weight: 600; }
   .card .auth { color: var(--muted); font-size: .85rem; font-style: italic; }
   .card .why { color: var(--accent2); font-size: .8rem; font-family: system-ui, sans-serif; margin-top: auto; }
+.card .yr { color: var(--muted); font-weight: 400; font-size: .8rem; margin-left: .35rem; }
   .meta { color: var(--muted); font-size: .82rem; margin: 4px 0 18px; font-family: system-ui, sans-serif; }
   footer { margin-top: 48px; color: var(--muted); font-size: .8rem; text-align: center; font-family: system-ui, sans-serif; }
   footer a { color: var(--accent2); }
@@ -317,9 +318,10 @@ function render(data, wasUrl) {
     const cover = b.cover_id
       ? '<img loading="lazy" src="https://covers.openlibrary.org/b/id/' + b.cover_id + '-M.jpg" alt="">'
       : '<div class="ph">' + esc(b.title) + '</div>';
+    const year = b.first_publish_year ? '<span class="yr">' + b.first_publish_year + '</span>' : '';
     grid.insertAdjacentHTML('beforeend',
       '<div class="card">' + cover +
-      '<h3>' + esc(b.title) + '</h3>' +
+      '<h3>' + esc(b.title) + year + '</h3>' +
       '<div class="auth">' + esc(b.author) + '</div>' +
       '<div class="why">' + esc(b.why) + '</div></div>');
   });
