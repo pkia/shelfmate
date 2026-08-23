@@ -437,6 +437,36 @@ def test_recency_gives_subject_credit_from_search_doc(monkeypatch):
     assert "magic" in rec["subjects"]
 
 
+def test_recent_quota_in_final_list(monkeypatch):
+    """At least RECENT_SLOTS of the final list are recent releases,
+
+    even when old canon books outscore them. (Score tweaks alone left
+    the list 0/12 old — the reason the quota exists.)
+    """
+    doc = dict(DOC)
+    year_now = server._current_year()
+    def book(title, author, key, editions, year):
+        return {"title": title, "authors": [{"name": author}], "edition_count": editions,
+                "cover_id": None, "key": key, "first_publish_year": year}
+    canon = {  # 10 old canon books, each matching all three subjects
+        "fantasy": [book(f"Canon {i}", f"Author {i}", f"/works/OLA{i}W", 80, 1970) for i in range(10)],
+        "magic":   [book(f"Canon {i}", f"Author {i}", f"/works/OLA{i}W", 80, 1970) for i in range(10)],
+        "epic fiction": [book(f"Canon {i}", f"Author {i}", f"/works/OLA{i}W", 80, 1970) for i in range(10)],
+    }
+    fresh = {  # 6 new books, one subject each — lower scores than canon
+        "fantasy": [book(f"New {i}", f"NewAuthor {i}", f"/works/OLB{i}W", 2, year_now) for i in range(6)],
+    }
+    _fake_ol(monkeypatch, {"The Name of the Wind": doc}, canon,
+             recent={"fantasy": fresh["fantasy"]})
+    result = server.recommend([{"title": "The Name of the Wind", "source": "manual"}])
+    years = [r["first_publish_year"] for r in result["recs"]]
+    assert len(result["recs"]) == server.MAX_RECS
+    n_recent = sum(1 for y in years if year_now - y <= server.RECENT_WINDOW_YEARS)
+    assert n_recent >= min(server.RECENT_SLOTS, 6), years
+    # canon still present too — quota reserves, not replaces
+    assert any(year_now - y > server.RECENT_WINDOW_YEARS for y in years)
+
+
 def test_ancient_book_no_recency_credit(monkeypatch):
     """An undated or ancient work gets no floor help and no bonus."""
     doc = dict(DOC)

@@ -56,9 +56,10 @@ MAX_RECS = 12
 MIN_OVERLAP = 0.99       # absolute floor: at least one shared subject of unit weight
 REL_OVERLAP = 0.35       # ...and keep only candidates within this fraction of the best match
 EDITIONS_PRIOR_CAP = 30  # popularity prior cap: 500-edition classics can't bank it
-RECENT_SUBJECTS = 3      # top-N taste subjects also searched for recent releases
+RECENT_SUBJECTS = 6      # top-N taste subjects also searched for recent releases
 RECENT_WINDOW_YEARS = 5  # "recent" = first published within this many years
 RECENT_BONUS = 1.2       # max score bonus for a brand-new book (fades over ~15y)
+RECENT_SLOTS = 4         # of MAX_RECS, at least this many recent releases
 
 
 def _current_year() -> int:
@@ -558,15 +559,38 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
         entry["why"] = _reason_phrase(entry, matched, seeds_with_subjects)
 
     ranked = sorted(scored, key=lambda e: e["score"], reverse=True)
-    recs, per_author = [], Counter()
-    for entry in ranked:
-        if per_author[entry["author"].lower()] >= 2:
-            continue
+
+    def is_recent(entry: dict) -> bool:
+        year = entry.get("first_publish_year")
+        return isinstance(year, int) and _current_year() - year <= RECENT_WINDOW_YEARS
+
+    # Selection: reserve at least RECENT_SLOTS of MAX_RECS for recent
+    # releases, then fill the rest with the best-scoring remaining books
+    # (any age), then present the picked set in score order. Without the
+    # reservation, deep canon pools + librarian subject tags crowd out
+    # every new release — the exact complaint this fixes.
+    per_author: Counter = Counter()
+
+    def pick(entry: dict) -> None:
         per_author[entry["author"].lower()] += 1
         entry["subjects"] = sorted(entry["subjects"])[:5]
-        recs.append(entry)
-        if len(recs) >= MAX_RECS:
+
+    picked = []
+    for entry in ranked:                      # pass 1: recent releases
+        if len([e for e in picked if is_recent(e)]) >= RECENT_SLOTS:
             break
+        if per_author[entry["author"].lower()] >= 2 or not is_recent(entry):
+            continue
+        pick(entry)
+        picked.append(entry)
+    for entry in ranked:                      # pass 2: best of the rest
+        if len(picked) >= MAX_RECS:
+            break
+        if entry in picked or per_author[entry["author"].lower()] >= 2:
+            continue
+        pick(entry)
+        picked.append(entry)
+    recs = sorted(picked, key=lambda e: e["score"], reverse=True)[:MAX_RECS]
 
     return {
         "taste": taste.most_common(TOP_SUBJECTS),
