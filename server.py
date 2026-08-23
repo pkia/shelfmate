@@ -529,23 +529,37 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
                 if s in taste:
                     entry["subjects"].add(s)
 
-    # score: taste overlap + capped popularity prior + recency. Two quality
-    # floors: an absolute one (must genuinely share taste) and a relative
-    # one (top-heavy lists read better than padded ones). The recency
-    # bonus counts toward the absolute floor so new releases can clear it.
+    # score: taste overlap + capped popularity prior + recency. Quality
+    # floors: an absolute one every candidate must clear, plus a relative
+    # one that guards the canon pool against list-padding. Recent
+    # releases bypass only the relative floor — their quality bound is
+    # the absolute floor plus the RECENT_SLOTS quota, otherwise a deep
+    # canon pool (best overlap 9) locks out every new book (overlap ~1).
     overlaps = {
         key: sum(min(taste.get(s, 0), 4.0) for s in entry["subjects"] if taste.get(s, 0))
         for key, entry in candidates.items()
     }
-    best = max(overlaps.values(), default=0.0)
+
+    def _recent_year(entry: dict):
+        year = entry.get("first_publish_year")
+        return year if isinstance(year, int) else None
+
+    def _is_recent(entry: dict) -> bool:
+        year = _recent_year(entry)
+        return bool(year and _current_year() - year <= RECENT_WINDOW_YEARS)
+
+    best_canon = max((o for key, o in overlaps.items()
+                      if not _is_recent(candidates[key])),
+                     default=0.0)
     scored = []
     for key, entry in candidates.items():
         overlap = overlaps[key]
-        recency = _recency_bonus(entry.get("first_publish_year"))
-        # the recency bonus lets genuinely-shared-subject new releases
-        # clear both quality floors — without lowering them for old junk
+        recent = _is_recent(entry)
+        recency = _recency_bonus(_recent_year(entry))
         adj = overlap + recency
-        if adj < MIN_OVERLAP or adj < best * REL_OVERLAP:
+        if adj < MIN_OVERLAP:
+            continue
+        if not recent and overlap < best_canon * REL_OVERLAP:
             continue
         entry["score"] = (overlap
                           + math.log10(min(int(entry["editions"] or 0), EDITIONS_PRIOR_CAP) + 1)
@@ -560,10 +574,6 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
 
     ranked = sorted(scored, key=lambda e: e["score"], reverse=True)
 
-    def is_recent(entry: dict) -> bool:
-        year = entry.get("first_publish_year")
-        return isinstance(year, int) and _current_year() - year <= RECENT_WINDOW_YEARS
-
     # Selection: reserve at least RECENT_SLOTS of MAX_RECS for recent
     # releases, then fill the rest with the best-scoring remaining books
     # (any age), then present the picked set in score order. Without the
@@ -577,9 +587,9 @@ def recommend(seeds: list[dict], exclude_titles: list[str] | None = None) -> dic
 
     picked = []
     for entry in ranked:                      # pass 1: recent releases
-        if len([e for e in picked if is_recent(e)]) >= RECENT_SLOTS:
+        if len([e for e in picked if _is_recent(e)]) >= RECENT_SLOTS:
             break
-        if per_author[entry["author"].lower()] >= 2 or not is_recent(entry):
+        if per_author[entry["author"].lower()] >= 2 or not _is_recent(entry):
             continue
         pick(entry)
         picked.append(entry)
